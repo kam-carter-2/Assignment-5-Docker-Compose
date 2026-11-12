@@ -1,0 +1,134 @@
+name: Recipe Sharing CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run backend tests
+        working-directory: backend
+        run: npm test
+
+  frontend-tests:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test
+
+  deploy:
+    name: Deploy to Google Cloud Run
+    runs-on: ubuntu-latest
+    needs:
+      - backend-tests
+      - frontend-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    env:
+      PROJECT_ID: arctic-defender-480623-t9
+      REGION: us-central1
+      REPOSITORY: recipe-images
+      BACKEND_SERVICE: recipe-backend
+      FRONTEND_SERVICE: recipe-frontend
+      RUNTIME_SERVICE_ACCOUNT: 998490626868-compute@developer.gserviceaccount.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker authentication
+        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+
+      - name: Build and push backend image
+        run: |
+          docker build \
+            -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/backend:${GITHUB_SHA} \
+            ./backend
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/backend:${GITHUB_SHA}
+
+      - name: Deploy backend
+        run: |
+          gcloud run deploy $BACKEND_SERVICE \
+            --image $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/backend:${GITHUB_SHA} \
+            --region $REGION \
+            --platform managed \
+            --port 5000 \
+            --service-account $RUNTIME_SERVICE_ACCOUNT \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Get backend URL
+        id: backend
+        run: |
+          URL=$(gcloud run services describe $BACKEND_SERVICE \
+            --region $REGION \
+            --format='value(status.url)')
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push frontend image
+        run: |
+          docker build \
+            --build-arg VITE_API_URL=${{ steps.backend.outputs.url }} \
+            -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/frontend:${GITHUB_SHA} \
+            ./frontend
+          docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/frontend:${GITHUB_SHA}
+
+      - name: Deploy frontend
+        run: |
+          gcloud run deploy $FRONTEND_SERVICE \
+            --image $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/frontend:${GITHUB_SHA} \
+            --region $REGION \
+            --platform managed \
+            --port 80 \
+            --allow-unauthenticated \
+            --quiet
